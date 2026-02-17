@@ -3,43 +3,70 @@
 #include <thread>
 #include <mutex>
 #include <vector>
+#include <algorithm>
 
 #pragma comment(lib, "ws2_32.lib")                                      // Подключаем библиотеку ws2_32
 
-int clientCount = 0;                                                    // Счетчик подключений
-std::mutex clientCountMutex;                                            // Взаимное исключение для client
-std::vector<SOCKET> clients;                                            // Динамический массив из SOCKET с "общим" именем clients
+struct Client {
+    int id;
+    SOCKET socket;
+};
+
+
+std::vector<Client> clients;                                            // Динамический массив из SOCKET с "общим" именем clients
 std::mutex clientsMutex;                                                // Взаимное исключение для clients
 
-void NewClient(SOCKET clientSocket) {
+std::atomic<int> nextClientId = 1;                                      // Можем заменить две строчки на (int ClientID = 1; )
 
-            char buffer[256];                                           // Буфер для приема данных 
-            int bufferSize = sizeof(buffer);                            // Сколь-ко байт можно прочитать
+void broadcast(const char* massage, int lenght, SOCKET sender = INVALID_SOCKET) {
+    std::vector<Client> clientsCopy;                                    // Создании копии для mutex, чтобы не держать блокировку на весь цикл send
+    std::lock_guard<std::mutex> lock(clientsMutex);
+    clientsCopy = clients;  
+       for (Client c : clientsCopy) {                                   // C++11 вместо for (i = 0; i < clients.size(); i++) { SOCKET s = clients[i]; } 
+           if (c.socket == sender) continue;                            // Исключаем отправителя
+           int bytesSend = send(c.socket, massage, lenght, 0);          // send(сокет, буфер отправки, кол-во прочитанных байт, 0)
+           if (bytesSend == SOCKET_ERROR) {                             // Send вернет SOCKET_ERROR при ошибке отправки данных клиенту
+               std::lock_guard<std::mutex> lock(clientsMutex);          
+               closesocket(c.socket);                                   // Закрываем сокет клиента с ошибкой (возможно клиент отключился)
+               clients.erase(
+                   std::remove_if(clients.begin(), clients.end(), [c](const Client& cl) { 
+                   return cl.socket == c.socket;
+                   }), clients.end()
+               );
+           }
+       }
+}
 
-            while (true) {
-            int bytesRead = recv(clientSocket, buffer, bufferSize, 0);  // recv(сокет с которого читаем, буфер получения, его размер, 0)
-            if (bytesRead == 0) {                                       // Если > 0 - данные пришли, если = 0 - клиент закрыл соединение 
-                break;
-            }
-            else if (bytesRead == SOCKET_ERROR) {                       // Проверка на ошибку
-                break;
-            }
-            std::lock_guard<std::mutex> lockClients(clientsMutex);      
-            for (SOCKET s : clients) {                                  // C++11 вместо for (i = 0; i < clients.size(); i++) { SOCKET s = clients[i]; } 
-                int bytesSend = send(s, buffer, bytesRead, 0);          // send(сокет, буфер отправки, кол-во прочитанных байт, 0)
-            }
+void NewClient(SOCKET clientSocket) {                                  
+    char buffer[256];                                                   // Буфер для приема данных 
+    int bufferSize = sizeof(buffer);                                    // Сколь-ко байт можно прочитать
+
+    while (true) {
             
-            }
 
-            std::lock_guard<std::mutex> lockClientCount(clientCountMutex);// Автоматическая блокировка
-            clientCount--;                                              // Счетчик подключений --
-            std::cout << "Client " << clientSocket << " unconnected \n";
 
-            std::lock_guard<std::mutex> lockClients(clientsMutex);      // Автоматическая блокировка
-            // clients.erase(std::remove(clients.begin(), clients.end(), clientSocket), clients.end()); // erase - удаляет элементы равные clientSocket,  remove - перемещает равные clientSocket элементы в конец
-            auto it = std::remove(clients.begin(), clients.end(), clientSocket);// Находим первый элемент clientSocket, перемещаем в конец, it указывает на начало clientSocket
-            clients.erase(it, clients.end());                           // Удаляем все от it до конца вектора
-            closesocket(clientSocket);                                  // Закрытие клиент-сокета
+        int bytesRead = recv(clientSocket, buffer, bufferSize, 0);      // recv(сокет с которого читаем, буфер получения, его размер, 0)
+        if (bytesRead == 0) {                                           // Если > 0 - данные пришли, если = 0 - клиент закрыл соединение 
+        break;
+        }
+        else if (bytesRead == SOCKET_ERROR) {                           // Проверка на ошибку
+            break;
+        }
+        broadcast(buffer, bytesRead);       
+    }
+
+ std::lock_guard<std::mutex> lock(clientsMutex);                        // Автоматическая блокировка                                                       // Счетчик подключений --
+ std::cout << "Client " << clientSocket << " disconnected \n"
+     << "Online is " << clients.size() << " clients \n";
+ std::lock_guard<std::mutex> lockClients(clientsMutex);                 // Автоматическая блокировка
+ // clients.erase(std::remove(clients.begin(), clients.end(), clientSocket), clients.end()); // erase - удаляет элементы равные clientSocket,  remove - перемещает равные clientSocket элементы в конец
+ auto it = std::remove_if(clients.begin(), clients.end(),               // Находим первый элемент clientSocket, перемещаем в конец, it указывает на начало clientSocket
+     [clientSocket](const Client& c) {
+         return c.socket == clientSocket;
+
+     });
+  clients.erase(it, clients.end());                                     // Удаляем все от it до конца вектора
+ closesocket(clientSocket);                                             // Закрытие клиент-сокета
  }
 
 int main()
@@ -79,10 +106,15 @@ int main()
             std::cout << "Accept failed\n";                             
         }
         std::lock_guard<std::mutex> lockClients(clientsMutex);          // Автоматическая блокировка для vector clients
-        clients.push_back(clientSocket);                                // 
-        std::lock_guard<std::mutex> lockClientCount(clientCountMutex);  // Автоматическая блокировка вместо lock() / unlock()
-        clientCount++;                                                  // Счетчик подключений ++
-        std::cout << "Client " << clientSocket << " connected " << " Client count - " << clientCount << "\n";
+
+        Client newClient;
+        newClient.id = nextClientId++;
+        newClient.socket = clientSocket;
+        clients.push_back(newClient);                                   // 
+
+        std::lock_guard<std::mutex> lock(clientsMutex);                 // Автоматическая блокировка вместо lock() / unlock()
+        std::cout << "Client " << clientSocket << " connected \n"
+            << "Online is " << clients.size() << " clients \n";
 
         std::thread threadClient (NewClient, clientSocket);             // Взаимное исключение
         threadClient.detach();                                          // Освобождение ресурсов потока
